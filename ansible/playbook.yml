@@ -1,0 +1,224 @@
+---
+- name: Configure Python FastAPI Application
+  hosts: all
+  gather_facts: false
+
+  vars:
+    ansible_connection: community.aws.aws_ssm
+    ansible_remote_tmp: /tmp/.ansible.tmp
+    ansible_user: ubuntu
+    app_dir: /opt/app
+    venv_dir: /opt/app/.venv
+    app_port: 8000
+
+  tasks:
+    #  Wait for system to be ready 
+    - name: Wait for system to be reachable via SSM
+      ansible.builtin.wait_for_connection:
+        timeout: 120
+        sleep: 10
+
+    - name: Gather facts after connection
+      ansible.builtin.setup:
+
+    #  OS updates and base packages 
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      become: true
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - python3.12
+          - python3.12-venv
+          - python3-pip
+          - nginx
+          - curl
+          - git
+        state: present
+      become: true
+
+    #  Application directory 
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+      become: true
+
+    #  Copy application files 
+    - name: Copy main.py entrypoint
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../main.py"
+        dest: "{{ app_dir }}/main.py"
+        mode: "0644"
+      become: true
+
+    - name: Copy app package directory
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../app/"
+        dest: "{{ app_dir }}/app/"
+        mode: "0644"
+      become: true
+
+    - name: Copy requirements.txt
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../requirements.txt"
+        dest: "{{ app_dir }}/requirements.txt"
+        mode: "0644"
+      become: true
+
+    - name: Check if public/ directory exists on controller
+      set_fact:
+        public_dir_files: "{{ lookup('fileglob', playbook_dir + '/../public/*', wantlist=True) }}"
+
+    - name: Copy public/ directory if it exists
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../public/"
+        dest: "{{ app_dir }}/public/"
+        mode: "0644"
+      become: true
+      when: public_dir_files | length > 0
+
+    #  Virtual environment and dependencies 
+    - name: Create Python virtual environment
+      ansible.builtin.command:
+        cmd: python3.12 -m venv {{ venv_dir }}
+        creates: "{{ venv_dir }}/bin/activate"
+      become: true
+
+    - name: Correct ownership of app directory
+      ansible.builtin.command:
+        cmd: chown -R ubuntu:ubuntu {{ app_dir }}
+      become: true
+
+    - name: Install Python dependencies in venv
+      ansible.builtin.pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_python: python3.12
+      become: true
+
+    - name: Ensure gunicorn and uvicorn are installed in venv
+      ansible.builtin.pip:
+        name:
+          - gunicorn
+          - uvicorn[standard]
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_python: python3.12
+      become: true
+
+    #  Systemd service 
+    - name: Create systemd service unit for app
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/app.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=FastAPI Application (awesomeec221)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          Group=ubuntu
+          WorkingDirectory={{ app_dir }}
+          ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
+            -k uvicorn.workers.UvicornWorker \
+            -w 4 \
+            -b 0.0.0.0:{{ app_port }}
+          Restart=on-failure
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+          Environment=APP_ENV=production
+          Environment=PORT={{ app_port }}
+
+          [Install]
+          WantedBy=multi-user.target
+      become: true
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+      become: true
+
+    - name: Enable and start app service
+      ansible.builtin.systemd:
+        name: app.service
+        enabled: true
+        state: restarted
+      become: true
+
+    #  Nginx reverse proxy 
+    - name: Remove default nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      become: true
+
+    - name: Configure nginx as reverse proxy
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/app
+        mode: "0644"
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass         http://127.0.0.1:{{ app_port }};
+                  proxy_set_header   Host              $host;
+                  proxy_set_header   X-Real-IP         $remote_addr;
+                  proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 60s;
+                  proxy_connect_timeout 10s;
+              }
+          }
+      become: true
+
+    - name: Enable nginx app site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+      become: true
+
+    - name: Test nginx configuration
+      ansible.builtin.command:
+        cmd: nginx -t
+      become: true
+      changed_when: false
+
+    - name: Enable and restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: true
+        state: restarted
+      become: true
+
+    #  Verify app is running locally 
+    - name: Wait for app to be listening on port 8000
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        timeout: 60
+        state: started
+
+    - name: Smoke test app locally via curl
+      ansible.builtin.command:
+        cmd: curl -Lsf -o /dev/null -w "%{http_code}" http://127.0.0.1:{{ app_port }}/health/
+      register: local_health
+      changed_when: false
+
+    - name: Assert local health check passed
+      ansible.builtin.assert:
+        that:
+          - local_health.stdout | regex_search('^[23]')
+        fail_msg: "Local health check returned {{ local_health.stdout }}, expected 2xx or 3xx"
+        success_msg: "Local health check passed with HTTP {{ local_health.stdout }}"
