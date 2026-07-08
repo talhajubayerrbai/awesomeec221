@@ -219,6 +219,6 @@
     - name: Assert local health check passed
       ansible.builtin.assert:
         that:
-          - local_health.stdout | regex_search('^[23]') | bool
+          - local_health.stdout | regex_search('^[23]') is not none
         fail_msg: "Local health check returned {{ local_health.stdout }}, expected 2xx or 3xx"
         success_msg: "Local health check passed with HTTP {{ local_health.stdout }}"
