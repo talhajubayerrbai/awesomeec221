@@ -112,6 +112,29 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      - name: Terraform init (to read outputs)
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Read SSM bucket name from Terraform state
+        id: tf_outputs
+        working-directory: terraform
+        run: |
+          # Read directly from Terraform state to avoid GitHub Actions secret-masking
+          # which silently blanks job outputs whose values match registered secret patterns.
+          SSM_BUCKET=$(terraform output -raw ssm_bucket_name)
+          echo "ssm_bucket=${SSM_BUCKET}" >> "$GITHUB_OUTPUT"
+
       - name: Install Python for Ansible
         uses: actions/setup-python@v5
         with:
@@ -154,18 +177,10 @@ jobs:
             sleep 20
           done
 
-      - name: Build SSM bucket name (no secret interpolation)
-        id: bucket_name
-        env:
-          SSM_BUCKET_FROM_TF: ${{ needs.provision.outputs.ssm_bucket }}
-        run: |
-          # Use the bucket name captured from Terraform output directly
-          echo "ssm_bucket=${SSM_BUCKET_FROM_TF}" >> "$GITHUB_OUTPUT"
-
       - name: Run Ansible playbook via SSM
         env:
           INSTANCE_ID: ${{ needs.provision.outputs.instance_id }}
-          SSM_BUCKET: ${{ steps.bucket_name.outputs.ssm_bucket }}
+          SSM_BUCKET: ${{ steps.tf_outputs.outputs.ssm_bucket }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           ANSIBLE_HOST_KEY_CHECKING: "False"
         run: |
